@@ -417,6 +417,7 @@ class MainWindow(QMainWindow):
         self.file_data = {} 
         self.stop_flag = False
         self.is_scanning = False
+        self.has_scanned_once = False
         self.scan_queue_index = 0
         
         # Audio Player
@@ -470,12 +471,12 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(self.btn_select)
         sb_layout.addSpacing(10)
 
-        # --- ANALYSIS SETTINGS ---
-        sb_layout.addWidget(self.create_header_label("ANALYSIS SETTINGS"))
+        # --- SCAN SETTINGS ---
+        sb_layout.addWidget(self.create_header_label("SCAN SETTINGS"))
         
-        self.analysis_frame = QFrame()
-        self.analysis_frame.setObjectName("StatsFrame")
-        af_layout = QVBoxLayout(self.analysis_frame)
+        self.settings_frame = QFrame()
+        self.settings_frame.setObjectName("StatsFrame")
+        af_layout = QVBoxLayout(self.settings_frame)
         af_layout.setContentsMargins(8, 8, 8, 8)
         af_layout.setSpacing(12)
         
@@ -545,11 +546,16 @@ class MainWindow(QMainWindow):
         gate_layout.addWidget(self.slider_gate)
         af_layout.addLayout(gate_layout)
 
-        sb_layout.addWidget(self.analysis_frame)
+        self.btn_defaults = QPushButton("RESTORE DEFAULTS")
+        self.btn_defaults.setStyleSheet("font-size: 10px; color: #888; font-weight: bold; border: 1px solid #444; margin-top: 5px;")
+        self.btn_defaults.clicked.connect(self.restore_defaults)
+        af_layout.addWidget(self.btn_defaults)
+
+        sb_layout.addWidget(self.settings_frame)
         sb_layout.addSpacing(10)
         
-        # Stats
-        sb_layout.addWidget(self.create_header_label("STATS"))
+        # ANALYSIS
+        sb_layout.addWidget(self.create_header_label("ANALYSIS"))
         self.stats_frame = QFrame()
         self.stats_frame.setObjectName("StatsFrame")
         stat_layout = QVBoxLayout(self.stats_frame)
@@ -567,30 +573,24 @@ class MainWindow(QMainWindow):
         
         sb_layout.addStretch()
 
-        # Moved Progress & Status above Action Button
+        # Moved progress bar and button grouping
         self.progress = QProgressBar()
-        self.progress.setFixedHeight(5)
+        self.progress.setFixedHeight(6)
         self.progress.setTextVisible(False)
         self.progress.setVisible(False)
         sb_layout.addWidget(self.progress)
         
         self.lbl_status = QLabel("Ready")
         self.lbl_status.setAlignment(Qt.AlignCenter)
-        self.lbl_status.setStyleSheet("color: #888;") 
+        self.lbl_status.setStyleSheet("color: #888; font-size: 11px;") 
         sb_layout.addWidget(self.lbl_status)
-        
-        actions_layout = QHBoxLayout()
-        actions_layout.setSpacing(8)
         
         self.btn_scan = QPushButton("SCAN")
         self.btn_scan.setObjectName("ActionBtn")
         self.btn_scan.setCursor(Qt.PointingHandCursor)
         self.btn_scan.clicked.connect(self.force_rescan)
-        actions_layout.addWidget(self.btn_scan)
-        
-        sb_layout.addLayout(actions_layout)
+        sb_layout.addWidget(self.btn_scan)
 
-        # IMPORTANT: Add the sidebar to the main layout!
         main_layout.addWidget(self.sidebar)
 
         # --- RIGHT SIDE ---
@@ -647,6 +647,12 @@ class MainWindow(QMainWindow):
         act_about.triggered.connect(self.show_about)
         help_menu.addAction(act_about)
 
+    def restore_defaults(self):
+        self.slider_thresh.setValue(50)
+        self.slider_win.setValue(10)
+        self.slider_gate.setValue(10)
+        self.update_settings_labels()
+
     def create_header_label(self, text):
         lbl = QLabel(text)
         lbl.setObjectName("SectionHeader")
@@ -688,9 +694,6 @@ class MainWindow(QMainWindow):
         f = QFileDialog.getOpenFileNames(self, "Select Audio", "", "Audio (*.wav *.aif *.mp3)")[0]
         if f: self.load_files(f)
     
-    def dropEvent(self, event):
-        self.load_files([url.toLocalFile() for url in event.mimeData().urls()])
-
     def stop_playback(self):
         self.player.stop()
         self.waveform.is_playing = False
@@ -710,6 +713,8 @@ class MainWindow(QMainWindow):
         self.lbl_issues.setText("Issues Found: 0")
         self.waveform.clear()
         self.last_active_row = -1
+        self.has_scanned_once = False
+        self.btn_scan.setText("SCAN")
 
     def load_files(self, paths):
         self.stop_playback()
@@ -761,7 +766,9 @@ class MainWindow(QMainWindow):
         self.start_scan_process()
 
     def start_scan_process(self):
+        if len(self.files) == 0: return
         self.is_scanning = True
+        self.progress.setVisible(True)
         self.btn_scan.setText("STOP")
         self.btn_scan.setObjectName("StopBtn")
         self.btn_scan.setStyle(self.btn_scan.style())
@@ -804,7 +811,8 @@ class MainWindow(QMainWindow):
 
     def finish_scan_ui(self):
         self.is_scanning = False
-        self.btn_scan.setText("SCAN")
+        self.has_scanned_once = True
+        self.btn_scan.setText("RE-SCAN")
         self.btn_scan.setObjectName("ActionBtn")
         self.btn_scan.setStyle(self.btn_scan.style())
         self.progress.setVisible(False)
@@ -824,9 +832,15 @@ class MainWindow(QMainWindow):
     def on_scan_finished(self, row, status, count, clicks):
         if row >= self.table.rowCount(): return
 
-        item_status = QTableWidgetItem(status)
-        if "Clean" in status: item_status.setForeground(QColor("#58A39C")) 
-        elif "Issues" in status: item_status.setForeground(QColor("#FF6B6B")) 
+        # We force the text to always say "Scanned"
+        item_status = QTableWidgetItem("Scanned") 
+        
+        # We still use the 'status' variable passed from the worker to decide the color
+        if "Clean" in status: 
+            item_status.setForeground(QColor("#58A39C")) # Greenish
+        else: 
+            item_status.setForeground(QColor("#FF6B6B")) # Reddish
+            
         self.table.setItem(row, 2, item_status)
 
         txt_count = str(count) if count > 0 else "0"
@@ -894,16 +908,15 @@ class MainWindow(QMainWindow):
             self.waveform.load_data(wf, clk, dur, path, sr)
 
     def on_table_double_click(self, index):
-        self.start_playback(index.row())
+        self.start_playback(index.row(), auto_play=True)
 
-    def start_playback(self, row):
+    def start_playback(self, row, auto_play=True):
         if self.is_scanning:
             self.lbl_status.setText("⚠️ Playback disabled during scan")
             return
         if row >= len(self.files): return
         
         self.player.stop() 
-        self.player.setSource(QUrl())
         path = self.files[row]
         
         if self.current_playing_row != -1:
@@ -913,8 +926,9 @@ class MainWindow(QMainWindow):
         self.last_active_row = row 
         
         self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.play()
-        self.waveform.is_playing = True
+        if auto_play:
+            self.player.play()
+            self.waveform.is_playing = True
         self.table.selectRow(row)
 
     def set_row_visuals(self, row, playing):
@@ -945,7 +959,7 @@ class MainWindow(QMainWindow):
         if row_to_play == -1: return
 
         if row_to_play != self.current_playing_row:
-            self.start_playback(row_to_play)
+            self.start_playback(row_to_play, auto_play=True)
             return
 
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -956,13 +970,10 @@ class MainWindow(QMainWindow):
     def seek_media(self, ms):
         if self.current_playing_row == -1:
             if self.last_active_row != -1:
-                self.start_playback(self.last_active_row)
+                self.start_playback(self.last_active_row, auto_play=False)
             else:
                 return
-
         self.player.setPosition(int(ms))
-        if self.player.playbackState() != QMediaPlayer.PlayingState:
-            self.player.play()
 
     def on_playback_state_changed(self, state):
         if self.current_playing_row != -1:
@@ -986,7 +997,7 @@ class MainWindow(QMainWindow):
                 <span style="font-family:'{self.font_family}'; font-size: 16px; font-weight: 600; font-style: italic; color: #808080;">CLICK DETECTOR</span>
             </div>
             <p style="margin-top: 20px; font-size: 12px; color: #e0e0e0;">
-                Version 1.0<br>
+                Version 1.2<br>
                 Copyright Rogue Waves 2026.
             </p>
         """
@@ -1030,15 +1041,13 @@ class MainWindow(QMainWindow):
             
             QPushButton#ActionBtn {{ 
                 background-color: #58A39C; color: white; border: none; 
-                font-weight: 600; font-style: italic; font-size: 32px; 
-                padding: 4px;
+                font-weight: 600; font-style: italic; font-size: 14px; 
             }}
             QPushButton#ActionBtn:hover {{ background-color: #68B3AC; }}
             
             QPushButton#StopBtn {{ 
                 background-color: #FF6B6B; color: white; border: none; 
-                font-weight: 600; font-style: italic; font-size: 32px; 
-                padding: 4px;
+                font-weight: 600; font-style: italic; font-size: 14px; 
             }}
             QPushButton#StopBtn:hover {{ background-color: #FF5252; }}
             
@@ -1061,38 +1070,17 @@ class MainWindow(QMainWindow):
             
             QHeaderView::section {{ background-color: #252525; color: #aaa; border: none; padding: 5px; font-weight: bold; font-size: 12px; text-transform: uppercase; }}
             
-            QProgressBar {{ background: #252525; border: none; }}
-            QProgressBar::chunk {{ background: #58A39C; }}
+            QProgressBar {{ background: #252525; border: none; border-radius: 3px; }}
+            QProgressBar::chunk {{ background: #58A39C; border-radius: 3px; }}
             
-            /* Exact Mac-Friendly Scrollbars from Faux Stereo */
-            QScrollBar:vertical {{
-                border: none;
-                background: transparent;
-                width: 10px;
-                margin: 0px;
-            }}
-            QScrollBar::handle:vertical {{
-                background-color: #555555;
-                min-height: 30px;
-                border-radius: 3px; 
-                margin: 2px;
-            }}
+            QScrollBar:vertical {{ border: none; background: transparent; width: 10px; margin: 0px; }}
+            QScrollBar::handle:vertical {{ background-color: #555555; min-height: 30px; border-radius: 3px; margin: 2px; }}
             QScrollBar::handle:vertical:hover {{ background-color: #666666; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
             
-            QScrollBar:horizontal {{
-                border: none;
-                background: transparent;
-                height: 10px;
-                margin: 0px;
-            }}
-            QScrollBar::handle:horizontal {{
-                background-color: #555555;
-                min-width: 30px;
-                border-radius: 3px;
-                margin: 2px;
-            }}
+            QScrollBar:horizontal {{ border: none; background: transparent; height: 10px; margin: 0px; }}
+            QScrollBar::handle:horizontal {{ background-color: #555555; min-width: 30px; border-radius: 3px; margin: 2px; }}
             QScrollBar::handle:horizontal:hover {{ background-color: #666666; }}
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
         """)
