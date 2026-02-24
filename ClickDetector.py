@@ -207,7 +207,7 @@ class ClickAnalysisWorker(QRunnable):
 class ClickWaveformWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(100) # Reduced default height profile
+        self.setMinimumHeight(100)
         self.setMouseTracking(True)
         self.waveform = None      
         self.clicks = None        
@@ -567,14 +567,9 @@ class MainWindow(QMainWindow):
         
         sb_layout.addStretch()
 
-        self.btn_scan = QPushButton("SCAN")
-        self.btn_scan.setObjectName("ActionBtn")
-        self.btn_scan.setCursor(Qt.PointingHandCursor)
-        self.btn_scan.clicked.connect(self.force_rescan)
-        sb_layout.addWidget(self.btn_scan)
-
+        # Moved Progress & Status above Action Button
         self.progress = QProgressBar()
-        self.progress.setFixedHeight(4)
+        self.progress.setFixedHeight(5)
         self.progress.setTextVisible(False)
         self.progress.setVisible(False)
         sb_layout.addWidget(self.progress)
@@ -584,6 +579,18 @@ class MainWindow(QMainWindow):
         self.lbl_status.setStyleSheet("color: #888;") 
         sb_layout.addWidget(self.lbl_status)
         
+        actions_layout = QHBoxLayout()
+        actions_layout.setSpacing(8)
+        
+        self.btn_scan = QPushButton("SCAN")
+        self.btn_scan.setObjectName("ActionBtn")
+        self.btn_scan.setCursor(Qt.PointingHandCursor)
+        self.btn_scan.clicked.connect(self.force_rescan)
+        actions_layout.addWidget(self.btn_scan)
+        
+        sb_layout.addLayout(actions_layout)
+
+        # IMPORTANT: Add the sidebar to the main layout!
         main_layout.addWidget(self.sidebar)
 
         # --- RIGHT SIDE ---
@@ -601,7 +608,6 @@ class MainWindow(QMainWindow):
         self.waveform = ClickWaveformWidget()
         right_splitter.addWidget(self.waveform)
         
-        # Adjusted Stretch Factors to make waveform ~2/3 of previous size
         right_splitter.setStretchFactor(0, 4) 
         right_splitter.setStretchFactor(1, 1)
         right_splitter.setSizes([600, 150])
@@ -871,7 +877,6 @@ class MainWindow(QMainWindow):
         if not rows: return
         row = rows[0].row()
         
-        # Immediately stop playback if user clicks a different file
         if self.current_playing_row != -1 and self.current_playing_row != row:
             self.stop_playback()
             
@@ -1025,15 +1030,15 @@ class MainWindow(QMainWindow):
             
             QPushButton#ActionBtn {{ 
                 background-color: #58A39C; color: white; border: none; 
-                font-weight: 600; font-style: italic; font-size: 13px; 
-                padding: 4px; min-height: 32px;
+                font-weight: 600; font-style: italic; font-size: 32px; 
+                padding: 4px;
             }}
             QPushButton#ActionBtn:hover {{ background-color: #68B3AC; }}
             
             QPushButton#StopBtn {{ 
                 background-color: #FF6B6B; color: white; border: none; 
-                font-weight: 600; font-style: italic; font-size: 13px; 
-                padding: 4px; min-height: 32px;
+                font-weight: 600; font-style: italic; font-size: 32px; 
+                padding: 4px;
             }}
             QPushButton#StopBtn:hover {{ background-color: #FF5252; }}
             
@@ -1059,18 +1064,37 @@ class MainWindow(QMainWindow):
             QProgressBar {{ background: #252525; border: none; }}
             QProgressBar::chunk {{ background: #58A39C; }}
             
-            /* Mac-Friendly Scrollbars */
-            QScrollBar:vertical {{ background-color: transparent; width: 14px; margin: 0px; }}
-            QScrollBar::handle:vertical {{ background-color: #4A4A4A; min-height: 30px; border-radius: 7px; margin: 2px; }}
-            QScrollBar::handle:vertical:hover {{ background-color: #58A39C; }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; background: none; }}
+            /* Exact Mac-Friendly Scrollbars from Faux Stereo */
+            QScrollBar:vertical {{
+                border: none;
+                background: transparent;
+                width: 10px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: #555555;
+                min-height: 30px;
+                border-radius: 3px; 
+                margin: 2px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background-color: #666666; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
-
-            QScrollBar:horizontal {{ background-color: transparent; height: 14px; margin: 0px; }}
-            QScrollBar::handle:horizontal {{ background-color: #4A4A4A; min-width: 30px; border-radius: 7px; margin: 2px; }}
-            QScrollBar::handle:horizontal:hover {{ background-color: #58A39C; }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; background: none; }}
-            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: none; }}
+            
+            QScrollBar:horizontal {{
+                border: none;
+                background: transparent;
+                height: 10px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background-color: #555555;
+                min-width: 30px;
+                border-radius: 3px;
+                margin: 2px;
+            }}
+            QScrollBar::handle:horizontal:hover {{ background-color: #666666; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
         """)
 
 def load_custom_fonts():
