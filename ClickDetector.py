@@ -18,16 +18,15 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QTableWidget, QTableWidgetItem, QMessageBox,
     QHeaderView, QLabel, QFrame, QAbstractItemView, QProgressBar, 
-    QMenu, QSlider, QSplitter, QDialog, QMenuBar, QComboBox, QListView,
-    QStyledItemDelegate
+    QSlider, QSplitter, QComboBox
 )
 from PySide6.QtCore import (
     Qt, QRunnable, Slot, Signal, QObject, QThreadPool, 
-    QUrl, QPoint, QTimer
+    QUrl, QPoint
 )
 from PySide6.QtGui import (
     QFont, QKeyEvent, QColor, QPainter, QPen, QFontDatabase, 
-    QFontMetrics, QCursor, QPalette, QAction
+    QFontMetrics, QCursor, QPalette
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
@@ -70,14 +69,18 @@ def get_clean_env():
     return env
 
 # -----------------------------
-# REPAIR ENGINE (BASS ENERGY CORRECTION)
+# REPAIR ENGINE (PRO AR WITH INTENSITY)
 # -----------------------------
-def repair_audio_logic(samples, indices, method="Pro (AR)"):
+def repair_audio_logic(samples, indices, intensity=5):
     if not indices: return samples.copy()
     repaired = np.array(samples, copy=True, dtype=np.float32, order='C')
     n_samples = len(repaired)
     
-    pad = 100 if method == "Pro (AR)" else (25 if method == "Smooth (Cubic)" else 5)
+    # Scale parameters based on Intensity (1-10)
+    pad = int(40 + (intensity * 12))
+    context_len = int(400 + (intensity * 160))
+    ar_order = int(40 + (intensity * 20))
+    
     group_dist = pad * 2
     regions = []
     current_region = [indices[0], indices[0]]
@@ -91,7 +94,6 @@ def repair_audio_logic(samples, indices, method="Pro (AR)"):
     def compute_ar_coeffs(x, order):
         n = len(x)
         if n <= order: return np.zeros(order)
-        # Detrend to prevent DC leakage in prediction
         x_norm = x - np.linspace(x[0], x[-1], n)
         win = np.hanning(n)
         xw = x_norm * win
@@ -101,33 +103,22 @@ def repair_audio_logic(samples, indices, method="Pro (AR)"):
         for i in range(order):
             for j in range(order): T[i,j] = R[abs(i-j)]
         try:
-            T += np.eye(order) * R[0] * 1e-3 # Stronger regularization
+            T += np.eye(order) * R[0] * 1e-3
             coeffs, _, _, _ = np.linalg.lstsq(T, r, rcond=None)
             return coeffs
         except: return np.zeros(order)
 
     for r_start, r_end in regions:
-        # Step back further to analyze low-frequency swing
         start = max(20, r_start - pad)
         end = min(n_samples - 21, r_end + pad + 1)
         gap_len = end - start
         if gap_len <= 0: continue
         
-        # --- QUINTIC BACKBONE WITH LOCAL AVERAGING ---
-        # Instead of single-sample slope, we average over 5 samples to avoid thumps
         t = np.linspace(0, 1, gap_len)
-        y0 = np.mean(repaired[start-3:start])
-        y1 = np.mean(repaired[end:end+3])
-        
-        # Calculate robust slopes (v) and curvature (a)
-        v0 = np.mean(np.diff(repaired[start-6:start]))
-        v1 = np.mean(np.diff(repaired[end:end+6]))
-        
-        # Acceleration (Curvature)
-        a0 = np.mean(np.diff(repaired[start-6:start], n=2))
-        a1 = np.mean(np.diff(repaired[end:end+6], n=2))
+        y0, y1 = np.mean(repaired[start-3:start]), np.mean(repaired[end:end+3])
+        v0, v1 = np.mean(np.diff(repaired[start-6:start])), np.mean(np.diff(repaired[end:end+6]))
+        a0, a1 = np.mean(np.diff(repaired[start-6:start], n=2)), np.mean(np.diff(repaired[end:end+6], n=2))
 
-        # Quintic Hermite Basis
         h0 = 1 - 10*t**3 + 15*t**4 - 6*t**5
         h1 = t - 6*t**3 + 8*t**4 - 3*t**5
         h2 = 0.5*t**2 - 1.5*t**3 + 1.5*t**4 - 0.5*t**5
@@ -136,47 +127,29 @@ def repair_audio_logic(samples, indices, method="Pro (AR)"):
         h5 = 0.5*t**3 - t**4 + 0.5*t**5
         backbone = y0*h0 + v0*h1 + a0*h2 + y1*h3 + v1*h4 + a1*h5
 
-        if method == "Fast (Linear)":
-            repaired[start:end] = np.interp(np.arange(start, end), [start-1, end], [repaired[start-1], repaired[end]])
-        elif method == "Smooth (Cubic)":
-            repaired[start:end] = backbone
-        elif method == "Pro (AR)":
-            avail = min(1200, start-10, n_samples - end - 10); order = min(150, avail // 4)
-            if order < 16:
-                repaired[start:end] = backbone
-                continue
-            
-            # --- FORWARD TEXTURE ---
-            xl = repaired[start - avail : start]
-            xl_detrend = xl - np.polyval(np.polyfit(np.arange(avail), xl, 2), np.arange(avail))
-            wl = compute_ar_coeffs(xl_detrend, order)
-            pf = np.zeros(gap_len); hf = xl_detrend[-order:][::-1]
-            for i in range(gap_len):
-                val = np.dot(wl, hf); pf[i] = val
-                hf = np.insert(hf[:-1], 0, val)
+        avail = min(context_len, start-10, n_samples - end - 10); order = min(ar_order, avail // 4)
+        if order < 16:
+            repaired[start:end] = backbone; continue
+        
+        xl = repaired[start - avail : start]
+        xl_detrend = xl - np.polyval(np.polyfit(np.arange(avail), xl, 2), np.arange(avail))
+        wl = compute_ar_coeffs(xl_detrend, order)
+        pf = np.zeros(gap_len); hf = xl_detrend[-order:][::-1]
+        for i in range(gap_len):
+            val = np.dot(wl, hf); pf[i] = val; hf = np.insert(hf[:-1], 0, val)
 
-            # --- BACKWARD TEXTURE ---
-            xr = repaired[end : end + avail]
-            xr_rev = xr[::-1]
-            xr_detrend = xr_rev - np.polyval(np.polyfit(np.arange(avail), xr_rev, 2), np.arange(avail))
-            wb = compute_ar_coeffs(xr_detrend, order)
-            pb_rev = np.zeros(gap_len); hb = xr_detrend[-order:][::-1]
-            for i in range(gap_len):
-                val = np.dot(wb, hb); pb_rev[i] = val
-                hb = np.insert(hb[:-1], 0, val)
-            pb = pb_rev[::-1]
-
-            # --- ZERO-PHASE MIXING ---
-            fade = (1 - np.cos(np.linspace(0, 1, gap_len) * np.pi)) / 2 
-            texture = pf * (1 - fade) + pb * fade
-            
-            # Final Safety: High-pass the texture residual to remove DC offset jumps
-            # This ensures the AR prediction doesn't fight the backbone's low freq
-            texture_hp = texture - np.mean(texture)
-            
-            # Tapered Windowing
-            taper = np.sin(np.linspace(0, np.pi, gap_len))
-            repaired[start:end] = backbone + (texture_hp * taper)
+        xr = repaired[end : end + avail]
+        xr_rev = xr[::-1]
+        xr_detrend = xr_rev - np.polyval(np.polyfit(np.arange(avail), xr_rev, 2), np.arange(avail))
+        wb = compute_ar_coeffs(xr_detrend, order)
+        pb_rev = np.zeros(gap_len); hb = xr_detrend[-order:][::-1]
+        for i in range(gap_len):
+            val = np.dot(wb, hb); pb_rev[i] = val; hb = np.insert(hb[:-1], 0, val)
+        
+        fade = (1 - np.cos(np.linspace(0, 1, gap_len) * np.pi)) / 2 
+        texture = pf * (1 - fade) + (pb_rev[::-1]) * fade
+        texture_hp = texture - np.mean(texture)
+        repaired[start:end] = backbone + (texture_hp * np.sin(np.linspace(0, np.pi, gap_len)))
             
     return repaired
 
@@ -188,20 +161,6 @@ class Signals(QObject):
     waveform_ready = Signal(int, int, list, float, int) 
     scan_finished = Signal(int, int, str, int, object)    
     repair_finished = Signal(int, bool, str)
-
-class FileDiscoveryWorker(QRunnable):
-    def __init__(self, inputs):
-        super().__init__(); self.inputs = inputs; self.signals = Signals()
-    @Slot()
-    def run(self):
-        found = []; exts = ('.wav', '.aiff', '.aif', '.mp3', '.flac', '.ogg')
-        for path in self.inputs:
-            if os.path.isdir(path):
-                for r, _, files in os.walk(path):
-                    for f in files:
-                        if f.lower().endswith(exts) and not f.startswith("._"): found.append(os.path.join(r, f))
-            elif path.lower().endswith(exts): found.append(path)
-        found.sort(); self.signals.discovery_finished.emit(found)
 
 class ClickAnalysisWorker(QRunnable):
     def __init__(self, scan_id, row, path, threshold, window, gate, stop_func):
@@ -226,19 +185,18 @@ class ClickAnalysisWorker(QRunnable):
             local_avg = np.convolve(diffs, np.ones(int(self.window))/int(self.window), mode='same')
             condition = (diffs / (local_avg + 1e-9) > self.threshold) & (np.abs(samples) > self.gate)
             peaks = np.where(condition)[0].tolist()
-            self.signals.scan_finished.emit(self.scan_id, self.row, "Issues Found" if peaks else "Clean", len(peaks), peaks)
+            self.signals.scan_finished.emit(self.scan_id, self.row, "Clicks Detected" if peaks else "Clean", len(peaks), peaks)
         except: self.signals.scan_finished.emit(self.scan_id, self.row, "Error", 0, [])
 
 class RepairWorker(QRunnable):
-    def __init__(self, row, path, indices, method):
-        super().__init__(); self.row, self.path, self.indices, self.method = row, path, indices, method; self.signals = Signals()
+    def __init__(self, row, path, indices, intensity):
+        super().__init__(); self.row, self.path, self.indices, self.intensity = row, path, indices, intensity; self.signals = Signals()
     @Slot()
     def run(self):
         try:
             cmd_meta = [FFMPEG_BIN, "-i", self.path]
             proc_m = subprocess.Popen(cmd_meta, stderr=subprocess.PIPE, env=get_clean_env())
-            _, err = proc_m.communicate()
-            meta_str = err.decode('utf-8', errors='ignore')
+            _, err = proc_m.communicate(); meta_str = err.decode('utf-8', errors='ignore')
             sr = 44100
             m_sr = re.search(r"(\d+) Hz", meta_str)
             if m_sr: sr = int(m_sr.group(1))
@@ -246,18 +204,31 @@ class RepairWorker(QRunnable):
             if "s24" in meta_str or "24 bit" in meta_str: s_fmt = "pcm_s24le"
             elif "s32" in meta_str or "32 bit" in meta_str: s_fmt = "pcm_s32le"
             elif "f32" in meta_str: s_fmt = "pcm_f32le"
-
             cmd_in =[FFMPEG_BIN, "-i", self.path, "-f", "f32le", "-ac", "1", "-"]
             proc_in = subprocess.Popen(cmd_in, stdout=subprocess.PIPE, env=get_clean_env())
             raw_data, _ = proc_in.communicate()
             samples = np.frombuffer(raw_data, dtype=np.float32).copy()
-            repaired = repair_audio_logic(samples, self.indices, self.method)
+            repaired = repair_audio_logic(samples, self.indices, self.intensity)
             base, _ = os.path.splitext(self.path); out_path = f"{base}_REPAIRED.wav"
             cmd_out =[FFMPEG_BIN, "-y", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "-", "-c:a", s_fmt, out_path]
             proc_out = subprocess.Popen(cmd_out, stdin=subprocess.PIPE, env=get_clean_env())
             proc_out.communicate(input=repaired.tobytes())
             self.signals.repair_finished.emit(self.row, True, out_path)
         except Exception as e: self.signals.repair_finished.emit(self.row, False, str(e))
+
+class FileDiscoveryWorker(QRunnable):
+    def __init__(self, inputs):
+        super().__init__(); self.inputs = inputs; self.signals = Signals()
+    @Slot()
+    def run(self):
+        found = []; exts = ('.wav', '.aiff', '.aif', '.mp3', '.flac', '.ogg')
+        for path in self.inputs:
+            if os.path.isdir(path):
+                for r, _, files in os.walk(path):
+                    for f in files:
+                        if f.lower().endswith(exts) and not f.startswith("._"): found.append(os.path.join(r, f))
+            elif path.lower().endswith(exts): found.append(path)
+        found.sort(); self.signals.discovery_finished.emit(found)
 
 # -----------------------------
 # UI COMPONENTS
@@ -271,7 +242,8 @@ class ClickWaveformWidget(QWidget):
         self.waveform, self.clicks, self.duration, self.sr = wf, clk, dur, sr; self.update()
     def mousePressEvent(self, event):
         if self.duration and event.button() == Qt.LeftButton:
-            self.window().seek_media((event.position().x() / self.width()) * self.duration * 1000)
+            ms = (event.position().x() / self.width()) * self.duration * 1000
+            self.window().seek_media(ms)
     def paintEvent(self, event):
         p = QPainter(self)
         if not self.waveform:
@@ -285,15 +257,14 @@ class ClickWaveformWidget(QWidget):
             scale = w / (self.duration * self.sr)
             for c in self.clicks:
                 cx = int(c * scale); p.drawLine(cx, 0, cx, h)
-        if self.duration > 0:
-            px = (self.playhead_ms / (self.duration * 1000)) * w
-            p.setPen(QPen(Qt.white, 2)); p.drawLine(int(px), 0, int(px), h)
+        px = (self.playhead_ms / (self.duration * 1000)) * w if self.duration > 0 else 0
+        p.setPen(QPen(Qt.white, 2)); p.drawLine(int(px), 0, int(px), h)
 
 class ModernTable(QTableWidget):
     files_dropped, selection_changed_custom, delete_signal, space_pressed = Signal(list), Signal(), Signal(), Signal()
     def __init__(self, font_family):
         super().__init__(0, 3); self.font_family = font_family
-        self.setHorizontalHeaderLabels(["File Name", "Clicks", "Status"])
+        self.setHorizontalHeaderLabels(["FILE NAME", "CLICKS", "STATUS"])
         for i in range(3): self.horizontalHeaderItem(i).setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.verticalHeader().setVisible(False); self.setShowGrid(False); self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QAbstractItemView.SelectRows); self.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -321,7 +292,8 @@ class MainWindow(QMainWindow):
         self.threadpool = QThreadPool(); self.files, self.file_data = [], {}
         self.is_scanning, self.stop_flag, self.current_scan_id = False, False, 0
         self.player = QMediaPlayer(); self.audio_output = QAudioOutput(); self.player.setAudioOutput(self.audio_output)
-        self.player.positionChanged.connect(self.on_pos_changed); self.current_playing_row = self.visualized_row = -1
+        self.player.positionChanged.connect(self.on_pos_changed); self.player.playbackStateChanged.connect(self.on_play_state_changed)
+        self.current_playing_row = self.visualized_row = -1
         self.setup_ui(); self.setup_dark_theme()
 
     def setup_ui(self):
@@ -329,14 +301,10 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(main_widget); layout.setContentsMargins(0,0,0,0); layout.setSpacing(0)
         self.sidebar = QFrame(); self.sidebar.setFixedWidth(300); self.sidebar.setObjectName("Sidebar")
         sb = QVBoxLayout(self.sidebar); sb.setContentsMargins(15, 20, 15, 20); sb.setSpacing(10)
-        
         title_size = self.get_optimal_font_size("ROGUE WAVES", 38, 270)
         self.lbl_logo = QLabel(f'<div align="center" style="line-height:0.8;"><span style="font-family:\'{self.font_family}\'; font-size:{title_size}px; font-weight:600; font-style:italic; color:#5ba49d;">ROGUE WAVES</span><br><span style="font-family:\'{self.font_family}\'; font-size:20px; font-weight:600; font-style:italic; color:#808080;">CLICK DETECTOR</span></div>')
-        sb.addWidget(self.lbl_logo); sb.addSpacing(10)
-
-        sb.addWidget(self.header_lbl("INPUT"))
+        sb.addWidget(self.lbl_logo); sb.addSpacing(10); sb.addWidget(self.header_lbl("INPUT"))
         btn_sel = QPushButton("Select Files / Folder"); btn_sel.clicked.connect(self.select_input); sb.addWidget(btn_sel)
-
         sb.addWidget(self.header_lbl("SCAN SETTINGS"))
         set_f = QFrame(); set_f.setObjectName("StatsFrame"); set_l = QVBoxLayout(set_f)
         self.slider_thresh = self.add_slider(set_l, "THRESHOLD (Ratio)", 20, 200, 50, "ratio")
@@ -344,21 +312,19 @@ class MainWindow(QMainWindow):
         self.slider_gate = self.add_slider(set_l, "NOISE GATE", 0, 200, 10, "noise")
         btn_def = QPushButton("RESTORE DEFAULTS"); btn_def.setFocusPolicy(Qt.NoFocus); btn_def.setStyleSheet("font-size: 10px; color:#888; border: 1px solid #444;")
         btn_def.clicked.connect(self.restore_defaults); set_l.addWidget(btn_def); sb.addWidget(set_f)
-
-        sb.addWidget(self.header_lbl("REPAIR SETTINGS"))
-        rep_f = QFrame(); rep_f.setObjectName("StatsFrame"); rep_l = QVBoxLayout(rep_f)
-        self.combo_method = QComboBox(); self.combo_method.addItems(["Fast (Linear)", "Smooth (Cubic)", "Pro (AR)"]); self.combo_method.setCurrentIndex(2)
-        rep_l.addWidget(QLabel("ALGORITHM")); rep_l.addWidget(self.combo_method); sb.addWidget(rep_f)
-
+        
+        sb.addWidget(self.header_lbl("REPAIR INTENSITY"))
+        int_f = QFrame(); int_f.setObjectName("StatsFrame"); int_l = QVBoxLayout(int_f)
+        self.slider_intense = self.add_slider(int_l, "STRENGTH", 1, 10, 5, "intensity")
+        sb.addWidget(int_f)
+        
         sb.addStretch()
         self.progress = QProgressBar(); self.progress.setFixedHeight(6); self.progress.setVisible(False); sb.addWidget(self.progress)
         self.lbl_status = QLabel("Ready"); self.lbl_status.setAlignment(Qt.AlignCenter); self.lbl_status.setStyleSheet("color:#888; font-size:11px;"); sb.addWidget(self.lbl_status)
-        
         btn_scan = QPushButton("SCAN"); btn_scan.setObjectName("ActionBtn"); btn_scan.clicked.connect(self.toggle_scan)
         btn_rep = QPushButton("REPAIR"); btn_rep.setObjectName("ActionBtn"); btn_rep.clicked.connect(self.run_repair)
         h = QHBoxLayout(); h.addWidget(btn_scan); h.addWidget(btn_rep); sb.addLayout(h)
         layout.addWidget(self.sidebar)
-
         splitter = QSplitter(Qt.Vertical); self.table = ModernTable(self.font_family)
         self.table.files_dropped.connect(self.load_files); self.table.selection_changed_custom.connect(self.on_table_select)
         self.table.doubleClicked.connect(lambda idx: self.start_playback(idx.row())); self.table.space_pressed.connect(self.handle_space_playback)
@@ -370,12 +336,13 @@ class MainWindow(QMainWindow):
         l = QLabel(txt); l.setObjectName("SectionHeader"); return l
     def add_slider(self, lay, txt, min_v, max_v, def_v, mode):
         h = QHBoxLayout(); lbl = QLabel(txt); lbl.setStyleSheet("color:#888; font-weight:bold; font-size:11px;")
-        val_lbl = QLabel(); val_lbl.setStyleSheet("color:#58A39C; font-weight:bold;"); h.addWidget(lbl); h.addStretch(); h.addWidget(val_lbl); lay.addLayout(h)
+        v_l = QLabel(); v_l.setStyleSheet("color:#58A39C; font-weight:bold;"); h.addWidget(lbl); h.addStretch(); h.addWidget(v_l); lay.addLayout(h)
         s = QSlider(Qt.Horizontal); s.setRange(min_v, max_v); s.setValue(def_v); lay.addWidget(s)
         def up():
-            if mode == "ratio": val_lbl.setText(f"{s.value()/10:.2f}")
-            elif mode == "samples": val_lbl.setText(f"{s.value()} samples")
-            else: val_lbl.setText(f"{s.value()/1000:.3f}")
+            if mode == "ratio": v_l.setText(f"{s.value()/10:.2f}")
+            elif mode == "samples": v_l.setText(f"{s.value()} samples")
+            elif mode == "intensity": v_l.setText(f"{s.value()}")
+            else: v_l.setText(f"{s.value()/1000:.3f}")
         s.valueChanged.connect(up); up(); return s
     def get_optimal_font_size(self, text, max_size, width):
         font = QFont(self.font_family, max_size, QFont.Bold)
@@ -399,7 +366,7 @@ class MainWindow(QMainWindow):
         for i, f in enumerate(files):
             self.table.setItem(i, 0, QTableWidgetItem(os.path.basename(f))); self.table.setItem(i, 1, QTableWidgetItem("-"))
             self.table.setItem(i, 2, QTableWidgetItem("Ready")); self.file_data[i] = {'wf': None, 'clk': [], 'dur': 0, 'sr': 44100}
-        if files: self.start_scan_process()
+        if files: self.table.selectRow(0); self.start_scan_process()
     def toggle_scan(self):
         if self.is_scanning: self.stop_flag = True
         else: self.start_scan_process()
@@ -417,31 +384,53 @@ class MainWindow(QMainWindow):
             if row == self.table.currentRow(): self.update_visualizer()
     def on_scan_finished(self, sid, row, status, count, peaks):
         if sid != self.current_scan_id: return
-        self.file_data[row]['clk'] = peaks; self.table.setItem(row, 1, QTableWidgetItem(str(count))); self.table.setItem(row, 2, QTableWidgetItem(status))
+        self.file_data[row]['clk'] = peaks
+        clr = QColor("#FF6B6B") if count > 0 else QColor("#58A39C")
+        it_clk = QTableWidgetItem(str(count)); it_clk.setForeground(clr); self.table.setItem(row, 1, it_clk)
+        it_st = QTableWidgetItem(status); it_st.setForeground(clr); self.table.setItem(row, 2, it_st)
+        if row == self.table.currentRow(): self.update_visualizer()
         self.progress.setValue(self.progress.value() + 1)
         if self.progress.value() == len(self.files): self.is_scanning = False; self.progress.setVisible(False)
     def run_repair(self):
-        m = self.combo_method.currentText()
+        itns = self.slider_intense.value()
         for r in range(self.table.rowCount()):
             d = self.file_data[r]
             if d['clk']:
-                worker = RepairWorker(r, self.files[r], d['clk'], m)
+                worker = RepairWorker(r, self.files[r], d['clk'], itns)
                 worker.signals.repair_finished.connect(self.on_repair_done); self.threadpool.start(worker)
     def on_repair_done(self, row, success, path):
-        if success: self.table.setItem(row, 2, QTableWidgetItem("Repaired ✓")); self.lbl_status.setText(f"Saved: {os.path.basename(path)}")
+        if success:
+            it = QTableWidgetItem("Repaired ✓"); it.setForeground(QColor("#58A39C")); self.table.setItem(row, 2, it)
+            self.lbl_status.setText(f"Saved: {os.path.basename(path)}")
     def on_table_select(self): self.update_visualizer()
     def update_visualizer(self):
         row = self.table.currentRow()
         if row != -1 and row in self.file_data:
-            d = self.file_data[row]; self.waveform.load_data(d['wf'], d['clk'], d['dur'], d['sr'])
+            d = self.file_data[row]; self.visualized_row = row
+            self.waveform.load_data(d['wf'], d['clk'], d['dur'], d['sr'])
     def start_playback(self, row):
         if row >= len(self.files): return
-        self.current_playing_row = row; self.player.setSource(QUrl.fromLocalFile(self.files[row])); self.player.play()
+        self.current_playing_row = row; self.player.setSource(QUrl.fromLocalFile(self.files[row]))
+        self.player.setPosition(int(self.waveform.playhead_ms)); self.player.play()
     def handle_space_playback(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState: self.player.pause()
         else: self.start_playback(self.table.currentRow())
-    def seek_media(self, ms): self.player.setPosition(int(ms))
-    def on_pos_changed(self, ms): self.waveform.playhead_ms = ms; self.waveform.update()
+    def seek_media(self, ms):
+        self.waveform.playhead_ms = ms; self.waveform.update()
+        # Even if paused, force the player to the position for the next play()
+        if self.visualized_row != self.current_playing_row:
+             self.player.setSource(QUrl.fromLocalFile(self.files[self.visualized_row]))
+             self.current_playing_row = self.visualized_row
+        self.player.setPosition(int(ms))
+    def on_pos_changed(self, ms):
+        if self.current_playing_row == self.visualized_row: self.waveform.playhead_ms = ms; self.waveform.update()
+    def on_play_state_changed(self, state): self.set_row_visuals(self.current_playing_row, state == QMediaPlayer.PlayingState)
+    def set_row_visuals(self, row, playing):
+        if row < 0 or row >= self.table.rowCount(): return
+        it = self.table.item(row, 0)
+        if not it: return
+        txt = it.text().replace("▶ ", "")
+        it.setText(f"▶ {txt}" if playing else txt); it.setForeground(QColor("#58A39C" if playing else "#DDD"))
     def setup_dark_theme(self):
         pal = QPalette(); pal.setColor(QPalette.Window, QColor(30, 30, 30)); pal.setColor(QPalette.Highlight, QColor(61, 96, 93)); self.setPalette(pal)
         self.setStyleSheet(f"""
@@ -451,10 +440,10 @@ class MainWindow(QMainWindow):
             QFrame#StatsFrame {{ background-color: #2A2A2A; border-radius: 4px; padding: 10px; }}
             QPushButton {{ background-color: #333; border: 1px solid #444; border-radius: 4px; padding: 6px; color: #DDD; }}
             QPushButton#ActionBtn {{ background-color: #58A39C; color: white; font-weight: bold; border: none; font-style: italic; font-size: 14px; }}
-            QTableWidget {{ background-color: #181818; alternate-background-color: #222; border: none; selection-background-color: #3D605D; outline: 0; }}
-            QHeaderView::section {{ background-color: #252525; border: none; padding: 5px; color: #888; font-weight: bold; }}
+            QTableWidget {{ background-color: #181818; alternate-background-color: #222; border: none; outline: 0; }}
+            QTableWidget::item:focus {{ background-color: transparent; border: none; outline: 0; }}
+            QHeaderView::section {{ background-color: #252525; border: none; padding: 10px; color: #888; font-weight: bold; }}
             QProgressBar::chunk {{ background-color: #58A39C; border-radius: 3px; }}
-            QComboBox {{ background: #1C1C1C; border: 1px solid #444; padding: 5px 10px; color: #DDD; border-radius: 4px; }}
             QSlider::groove:horizontal {{ height: 4px; background: #111; border-radius: 2px; }}
             QSlider::sub-page:horizontal {{ background: #58A39C; border-radius: 2px; }}
             QSlider::handle:horizontal {{ background: #FFF; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
