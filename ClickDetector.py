@@ -76,10 +76,8 @@ def repair_audio_logic(samples, indices, intensity=5):
     repaired = np.array(samples, copy=True, dtype=np.float32)
     n_samples = len(repaired)
     
-    # Linear scaling for predictable results
-    # look_around: 3 samples @ Int 1 -> 40 samples @ Int 10
+    # Linear scaling for parameters
     look_around = int(2 + (intensity * 3.8)) 
-    # order: 15 @ Int 1 -> 180 @ Int 10 (Higher = more ringing/smearing)
     order = int(12 + (intensity * 17))
     context = int(300 + (intensity * 120))
 
@@ -90,11 +88,13 @@ def repair_audio_logic(samples, indices, intensity=5):
         if idx - current_region[1] <= look_around * 2:
             current_region[1] = idx
         else:
-            regions.append(current_region); current_region = [idx, idx]
+            regions.append(current_region)
+            current_region = [idx, idx]
     regions.append(current_region)
 
     def solve_ar_coeffs(data, p):
         if len(data) <= p: p = len(data) // 2
+        if p < 2: return None
         x = data - np.mean(data)
         N = len(x); num_obs = N - p
         if num_obs <= 0: return None
@@ -102,20 +102,31 @@ def repair_audio_logic(samples, indices, intensity=5):
         for i in range(num_obs): X[i, :] = x[i : i + p][::-1]
         y = x[p:]
         try:
-            # Stable Tikhonov regularization (prevents pops/explosions)
             reg = np.eye(p) * (np.std(x) * 0.01)
             coeffs, _, _, _ = np.linalg.lstsq(np.vstack([X, reg]), np.concatenate([y, np.zeros(p)]), rcond=None)
             return coeffs
         except: return None
 
     for r_start, r_end in regions:
-        start = max(10, r_start - look_around)
+        # Determine boundaries
+        # We allow start to go to 0 now to catch "beginning of file" clicks
+        start = max(0, r_start - look_around)
         end = min(n_samples - 11, r_end + look_around + 1)
         gap_len = end - start
         if gap_len <= 0: continue
-        
+
+        # --- NEW: SPECIAL CASE FOR BEGINNING OF FILE ---
+        # If the click is within the first 100 samples (approx 2ms @ 44.1k), 
+        # just perform a short crossfade/fade-in.
+        if start < 100:
+            # Create a simple raised cosine fade-in over the gap length
+            # This effectively "mutes" the click and fades the audio in smoothly
+            fade_in = 0.5 * (1 - np.cos(np.linspace(0, np.pi, end)))
+            repaired[0:end] *= fade_in
+            continue
+        # -----------------------------------------------
+
         # 1. THE BACKBONE (Cubic Hermite)
-        # Matches Position and Slope (Velocity) to minimize bumps
         y0, y1 = repaired[start-1], repaired[end]
         v0, v1 = (repaired[start-1] - repaired[start-2]), (repaired[end+1] - repaired[end])
         t = np.linspace(0, 1, gap_len)
@@ -126,28 +137,31 @@ def repair_audio_logic(samples, indices, intensity=5):
         backbone = h00*y0 + h10*v0*gap_len*0.5 + h01*y1 + h11*v1*gap_len*0.5
 
         # 2. THE TEXTURE (Bidirectional AR)
-        l_ctx, r_ctx = repaired[max(0, start-context):start], repaired[end:min(n_samples, end+context)]
-        rms_in = (np.sqrt(np.mean(l_ctx**2)) + np.sqrt(np.mean(r_ctx**2))) / 2.0
+        l_ctx = repaired[max(0, start-context):start]
+        r_ctx = repaired[end:min(n_samples, end+context)]
         
+        # Ensure we have enough context for AR, otherwise fallback to backbone
+        if len(l_ctx) < order or len(r_ctx) < order:
+            repaired[start:end] = backbone
+            continue
+
+        rms_in = (np.sqrt(np.mean(l_ctx**2)) + np.sqrt(np.mean(r_ctx**2))) / 2.0
         cf, cb = solve_ar_coeffs(l_ctx, order), solve_ar_coeffs(r_ctx[::-1], order)
+        
         if cf is not None and cb is not None:
             pf, pb = np.zeros(gap_len), np.zeros(gap_len)
-            curr_f, curr_b = (l_ctx - np.mean(l_ctx))[-order:].tolist(), (r_ctx[::-1] - np.mean(r_ctx))[-order:].tolist()
+            curr_f = (l_ctx - np.mean(l_ctx))[-order:].tolist()
+            curr_b = (r_ctx[::-1] - np.mean(r_ctx))[-order:].tolist()
             for i in range(gap_len):
                 vf = np.dot(curr_f[::-1], cf); pf[i] = vf
                 curr_f.pop(0); curr_f.append(vf)
                 vb = np.dot(curr_b[::-1], cb); pb[i] = vb
                 curr_b.pop(0); curr_b.append(vb)
             
-            # Crossfade Predictions (Raised Cosine)
             fade = 0.5 * (1 - np.cos(np.linspace(0, np.pi, gap_len)))
             texture = (pf * (1 - fade)) + (pb[::-1] * fade)
-            
-            # Volume Matching (RMS)
             rms_out = np.sqrt(np.mean(texture**2)) + 1e-9
             texture *= (rms_in / rms_out)
-            
-            # S-Curve Window (Ensures zero-energy transition at edges)
             window = np.sin(np.linspace(0, np.pi, gap_len))
             repaired[start:end] = backbone + (texture * window)
         else:
