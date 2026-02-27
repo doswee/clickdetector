@@ -69,87 +69,89 @@ def get_clean_env():
     return env
 
 # -----------------------------
-# REPAIR ENGINE (PRO AR WITH INTENSITY)
+# REPAIR ENGINE (PRO BIDIRECTIONAL AR)
 # -----------------------------
 def repair_audio_logic(samples, indices, intensity=5):
     if not indices: return samples.copy()
-    repaired = np.array(samples, copy=True, dtype=np.float32, order='C')
+    repaired = np.array(samples, copy=True, dtype=np.float32)
     n_samples = len(repaired)
     
-    # Scale parameters based on Intensity (1-10)
-    pad = int(40 + (intensity * 12))
-    context_len = int(400 + (intensity * 160))
-    ar_order = int(40 + (intensity * 20))
-    
-    group_dist = pad * 2
+    # Linear scaling for predictable results
+    # look_around: 3 samples @ Int 1 -> 40 samples @ Int 10
+    look_around = int(2 + (intensity * 3.8)) 
+    # order: 15 @ Int 1 -> 180 @ Int 10 (Higher = more ringing/smearing)
+    order = int(12 + (intensity * 17))
+    context = int(300 + (intensity * 120))
+
+    # Cluster regions
     regions = []
     current_region = [indices[0], indices[0]]
     for idx in indices[1:]:
-        if idx - current_region[1] <= group_dist:
+        if idx - current_region[1] <= look_around * 2:
             current_region[1] = idx
         else:
             regions.append(current_region); current_region = [idx, idx]
     regions.append(current_region)
-    
-    def compute_ar_coeffs(x, order):
-        n = len(x)
-        if n <= order: return np.zeros(order)
-        x_norm = x - np.linspace(x[0], x[-1], n)
-        win = np.hanning(n)
-        xw = x_norm * win
-        R = np.correlate(xw, xw, mode='full')[n-1:]
-        if R[0] < 1e-12: return np.zeros(order)
-        r = R[1:order+1]; T = np.zeros((order, order))
-        for i in range(order):
-            for j in range(order): T[i,j] = R[abs(i-j)]
+
+    def solve_ar_coeffs(data, p):
+        if len(data) <= p: p = len(data) // 2
+        x = data - np.mean(data)
+        N = len(x); num_obs = N - p
+        if num_obs <= 0: return None
+        X = np.zeros((num_obs, p))
+        for i in range(num_obs): X[i, :] = x[i : i + p][::-1]
+        y = x[p:]
         try:
-            T += np.eye(order) * R[0] * 1e-3
-            coeffs, _, _, _ = np.linalg.lstsq(T, r, rcond=None)
+            # Stable Tikhonov regularization (prevents pops/explosions)
+            reg = np.eye(p) * (np.std(x) * 0.01)
+            coeffs, _, _, _ = np.linalg.lstsq(np.vstack([X, reg]), np.concatenate([y, np.zeros(p)]), rcond=None)
             return coeffs
-        except: return np.zeros(order)
+        except: return None
 
     for r_start, r_end in regions:
-        start = max(20, r_start - pad)
-        end = min(n_samples - 21, r_end + pad + 1)
+        start = max(10, r_start - look_around)
+        end = min(n_samples - 11, r_end + look_around + 1)
         gap_len = end - start
         if gap_len <= 0: continue
         
+        # 1. THE BACKBONE (Cubic Hermite)
+        # Matches Position and Slope (Velocity) to minimize bumps
+        y0, y1 = repaired[start-1], repaired[end]
+        v0, v1 = (repaired[start-1] - repaired[start-2]), (repaired[end+1] - repaired[end])
         t = np.linspace(0, 1, gap_len)
-        y0, y1 = np.mean(repaired[start-3:start]), np.mean(repaired[end:end+3])
-        v0, v1 = np.mean(np.diff(repaired[start-6:start])), np.mean(np.diff(repaired[end:end+6]))
-        a0, a1 = np.mean(np.diff(repaired[start-6:start], n=2)), np.mean(np.diff(repaired[end:end+6], n=2))
+        h00 = 2*t**3 - 3*t**2 + 1
+        h10 = t**3 - 2*t**2 + t
+        h01 = -2*t**3 + 3*t**2
+        h11 = t**3 - t**2
+        backbone = h00*y0 + h10*v0*gap_len*0.5 + h01*y1 + h11*v1*gap_len*0.5
 
-        h0 = 1 - 10*t**3 + 15*t**4 - 6*t**5
-        h1 = t - 6*t**3 + 8*t**4 - 3*t**5
-        h2 = 0.5*t**2 - 1.5*t**3 + 1.5*t**4 - 0.5*t**5
-        h3 = 10*t**3 - 15*t**4 + 6*t**5
-        h4 = -4*t**3 + 7*t**4 - 3*t**5
-        h5 = 0.5*t**3 - t**4 + 0.5*t**5
-        backbone = y0*h0 + v0*h1 + a0*h2 + y1*h3 + v1*h4 + a1*h5
-
-        avail = min(context_len, start-10, n_samples - end - 10); order = min(ar_order, avail // 4)
-        if order < 16:
-            repaired[start:end] = backbone; continue
+        # 2. THE TEXTURE (Bidirectional AR)
+        l_ctx, r_ctx = repaired[max(0, start-context):start], repaired[end:min(n_samples, end+context)]
+        rms_in = (np.sqrt(np.mean(l_ctx**2)) + np.sqrt(np.mean(r_ctx**2))) / 2.0
         
-        xl = repaired[start - avail : start]
-        xl_detrend = xl - np.polyval(np.polyfit(np.arange(avail), xl, 2), np.arange(avail))
-        wl = compute_ar_coeffs(xl_detrend, order)
-        pf = np.zeros(gap_len); hf = xl_detrend[-order:][::-1]
-        for i in range(gap_len):
-            val = np.dot(wl, hf); pf[i] = val; hf = np.insert(hf[:-1], 0, val)
-
-        xr = repaired[end : end + avail]
-        xr_rev = xr[::-1]
-        xr_detrend = xr_rev - np.polyval(np.polyfit(np.arange(avail), xr_rev, 2), np.arange(avail))
-        wb = compute_ar_coeffs(xr_detrend, order)
-        pb_rev = np.zeros(gap_len); hb = xr_detrend[-order:][::-1]
-        for i in range(gap_len):
-            val = np.dot(wb, hb); pb_rev[i] = val; hb = np.insert(hb[:-1], 0, val)
-        
-        fade = (1 - np.cos(np.linspace(0, 1, gap_len) * np.pi)) / 2 
-        texture = pf * (1 - fade) + (pb_rev[::-1]) * fade
-        texture_hp = texture - np.mean(texture)
-        repaired[start:end] = backbone + (texture_hp * np.sin(np.linspace(0, np.pi, gap_len)))
+        cf, cb = solve_ar_coeffs(l_ctx, order), solve_ar_coeffs(r_ctx[::-1], order)
+        if cf is not None and cb is not None:
+            pf, pb = np.zeros(gap_len), np.zeros(gap_len)
+            curr_f, curr_b = (l_ctx - np.mean(l_ctx))[-order:].tolist(), (r_ctx[::-1] - np.mean(r_ctx))[-order:].tolist()
+            for i in range(gap_len):
+                vf = np.dot(curr_f[::-1], cf); pf[i] = vf
+                curr_f.pop(0); curr_f.append(vf)
+                vb = np.dot(curr_b[::-1], cb); pb[i] = vb
+                curr_b.pop(0); curr_b.append(vb)
+            
+            # Crossfade Predictions (Raised Cosine)
+            fade = 0.5 * (1 - np.cos(np.linspace(0, np.pi, gap_len)))
+            texture = (pf * (1 - fade)) + (pb[::-1] * fade)
+            
+            # Volume Matching (RMS)
+            rms_out = np.sqrt(np.mean(texture**2)) + 1e-9
+            texture *= (rms_in / rms_out)
+            
+            # S-Curve Window (Ensures zero-energy transition at edges)
+            window = np.sin(np.linspace(0, np.pi, gap_len))
+            repaired[start:end] = backbone + (texture * window)
+        else:
+            repaired[start:end] = backbone
             
     return repaired
 
@@ -190,31 +192,47 @@ class ClickAnalysisWorker(QRunnable):
 
 class RepairWorker(QRunnable):
     def __init__(self, row, path, indices, intensity):
-        super().__init__(); self.row, self.path, self.indices, self.intensity = row, path, indices, intensity; self.signals = Signals()
+        super().__init__()
+        self.row, self.path, self.indices, self.intensity = row, path, indices, intensity
+        self.signals = Signals()
+
     @Slot()
     def run(self):
         try:
+            # Determine suffix based on intensity
+            suffix = f"_REPAIRED{self.intensity:02d}"
+            
             cmd_meta = [FFMPEG_BIN, "-i", self.path]
             proc_m = subprocess.Popen(cmd_meta, stderr=subprocess.PIPE, env=get_clean_env())
-            _, err = proc_m.communicate(); meta_str = err.decode('utf-8', errors='ignore')
+            _, err = proc_m.communicate()
+            meta_str = err.decode('utf-8', errors='ignore')
+            
             sr = 44100
             m_sr = re.search(r"(\d+) Hz", meta_str)
             if m_sr: sr = int(m_sr.group(1))
+            
             s_fmt = "pcm_s16le"
             if "s24" in meta_str or "24 bit" in meta_str: s_fmt = "pcm_s24le"
             elif "s32" in meta_str or "32 bit" in meta_str: s_fmt = "pcm_s32le"
             elif "f32" in meta_str: s_fmt = "pcm_f32le"
-            cmd_in =[FFMPEG_BIN, "-i", self.path, "-f", "f32le", "-ac", "1", "-"]
+
+            cmd_in = [FFMPEG_BIN, "-i", self.path, "-f", "f32le", "-ac", "1", "-"]
             proc_in = subprocess.Popen(cmd_in, stdout=subprocess.PIPE, env=get_clean_env())
             raw_data, _ = proc_in.communicate()
             samples = np.frombuffer(raw_data, dtype=np.float32).copy()
+
             repaired = repair_audio_logic(samples, self.indices, self.intensity)
-            base, _ = os.path.splitext(self.path); out_path = f"{base}_REPAIRED.wav"
-            cmd_out =[FFMPEG_BIN, "-y", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "-", "-c:a", s_fmt, out_path]
+            
+            base, _ = os.path.splitext(self.path)
+            out_path = f"{base}{suffix}.wav"
+            
+            cmd_out = [FFMPEG_BIN, "-y", "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "-", "-c:a", s_fmt, out_path]
             proc_out = subprocess.Popen(cmd_out, stdin=subprocess.PIPE, env=get_clean_env())
             proc_out.communicate(input=repaired.tobytes())
+            
             self.signals.repair_finished.emit(self.row, True, out_path)
-        except Exception as e: self.signals.repair_finished.emit(self.row, False, str(e))
+        except Exception as e: 
+            self.signals.repair_finished.emit(self.row, False, str(e))
 
 class FileDiscoveryWorker(QRunnable):
     def __init__(self, inputs):
@@ -400,8 +418,66 @@ class MainWindow(QMainWindow):
                 worker.signals.repair_finished.connect(self.on_repair_done); self.threadpool.start(worker)
     def on_repair_done(self, row, success, path):
         if success:
-            it = QTableWidgetItem("Repaired ✓"); it.setForeground(QColor("#58A39C")); self.table.setItem(row, 2, it)
-            self.lbl_status.setText(f"Saved: {os.path.basename(path)}")
+            it = QTableWidgetItem("Repaired")
+            it.setForeground(QColor("#58A39C"))
+            self.table.setItem(row, 2, it)
+            self.add_single_file(path) # Automatically add the new file to the bottom
+        else:
+            QMessageBox.critical(self, "Error", path)
+
+
+    def add_single_file(self, path):
+        if not path or path in self.files: return
+        new_row = self.table.rowCount()
+        self.files.append(path)
+        self.file_data[new_row] = {'wf': None, 'clk': [], 'dur': 0, 'sr': 44100}
+        
+        self.table.blockSignals(True)
+        self.table.insertRow(new_row)
+        self.table.setItem(new_row, 0, QTableWidgetItem(os.path.basename(path)))
+        self.table.setItem(new_row, 1, QTableWidgetItem("-"))
+        self.table.setItem(new_row, 2, QTableWidgetItem("Ready"))
+        self.table.blockSignals(False)
+        
+        # Immediate auto-scan
+        t, w, g = self.slider_thresh.value()/10.0, self.slider_win.value(), self.slider_gate.value()/1000.0
+        worker = ClickAnalysisWorker(self.current_scan_id, new_row, path, t, w, g, lambda: self.stop_flag)
+        worker.signals.waveform_ready.connect(self.on_waveform_ready)
+        worker.signals.scan_finished.connect(self.on_scan_finished)
+        self.threadpool.start(worker)
+
+    def on_table_select(self):
+        """Hard-reset playback and UI whenever a new file is clicked."""
+        self.player.stop()
+        self.player.setSource(QUrl("")) # Clear buffer
+        self.waveform.playhead_ms = 0
+        
+        row = self.table.currentRow()
+        if row != -1 and row in self.file_data:
+            self.visualized_row = row
+            d = self.file_data[row]
+            self.waveform.load_data(d['wf'], d['clk'], d['dur'], d['sr'])
+            
+            # Re-stage for new file
+            self.player.setSource(QUrl.fromLocalFile(self.files[row]))
+            self.player.setPosition(0) 
+            self.current_playing_row = row
+        
+        self.waveform.update()
+
+    def start_playback(self, row):
+        if row >= len(self.files): return
+        # Set source and play from the visual playhead position
+        self.player.setSource(QUrl.fromLocalFile(self.files[row]))
+        self.current_playing_row = row
+        self.player.setPosition(int(self.waveform.playhead_ms))
+        self.player.play()
+
+    def seek_media(self, ms):
+        self.waveform.playhead_ms = ms
+        self.waveform.update()
+        if self.visualized_row == self.current_playing_row:
+            self.player.setPosition(int(ms))
     def on_table_select(self): self.update_visualizer()
     def update_visualizer(self):
         row = self.table.currentRow()
@@ -409,9 +485,30 @@ class MainWindow(QMainWindow):
             d = self.file_data[row]; self.visualized_row = row
             self.waveform.load_data(d['wf'], d['clk'], d['dur'], d['sr'])
     def start_playback(self, row):
-        if row >= len(self.files): return
-        self.current_playing_row = row; self.player.setSource(QUrl.fromLocalFile(self.files[row]))
-        self.player.setPosition(int(self.waveform.playhead_ms)); self.player.play()
+            if row >= len(self.files): return
+            
+            # Update source if it's a different file
+            if self.current_playing_row != row:
+                self.player.setSource(QUrl.fromLocalFile(self.files[row]))
+                self.current_playing_row = row
+            
+            # Force position to the playhead shown on the waveform
+            self.player.setPosition(int(self.waveform.playhead_ms))
+            self.player.play()
+
+    def seek_media(self, ms):
+        """Updates internal playhead and syncs player if it's the current file."""
+        self.waveform.playhead_ms = ms
+        self.waveform.update()
+        
+        # If we are seeking the file currently loaded in the player, sync immediately
+        if self.visualized_row == self.current_playing_row:
+            self.player.setPosition(int(ms))
+        else:
+            # If user clicks a different file's waveform, prepare that file
+            self.player.setSource(QUrl.fromLocalFile(self.files[self.visualized_row]))
+            self.current_playing_row = self.visualized_row
+            self.player.setPosition(int(ms))
     def handle_space_playback(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState: self.player.pause()
         else: self.start_playback(self.table.currentRow())
@@ -432,7 +529,10 @@ class MainWindow(QMainWindow):
         txt = it.text().replace("▶ ", "")
         it.setText(f"▶ {txt}" if playing else txt); it.setForeground(QColor("#58A39C" if playing else "#DDD"))
     def setup_dark_theme(self):
-        pal = QPalette(); pal.setColor(QPalette.Window, QColor(30, 30, 30)); pal.setColor(QPalette.Highlight, QColor(61, 96, 93)); self.setPalette(pal)
+        pal = QPalette()
+        pal.setColor(QPalette.Window, QColor(30, 30, 30))
+        pal.setColor(QPalette.Highlight, QColor(88, 163, 156)) 
+        self.setPalette(pal)
         self.setStyleSheet(f"""
             QWidget {{ font-family: '{self.font_family}'; font-size: 13px; color: #DDD; }}
             QFrame#Sidebar {{ background-color: #252525; border-right: 1px solid #333; }}
@@ -440,8 +540,8 @@ class MainWindow(QMainWindow):
             QFrame#StatsFrame {{ background-color: #2A2A2A; border-radius: 4px; padding: 10px; }}
             QPushButton {{ background-color: #333; border: 1px solid #444; border-radius: 4px; padding: 6px; color: #DDD; }}
             QPushButton#ActionBtn {{ background-color: #58A39C; color: white; font-weight: bold; border: none; font-style: italic; font-size: 14px; }}
-            QTableWidget {{ background-color: #181818; alternate-background-color: #222; border: none; outline: 0; }}
-            QTableWidget::item:focus {{ background-color: transparent; border: none; outline: 0; }}
+            QTableWidget {{ background-color: #181818; alternate-background-color: #222; border: none; outline: 0; selection-background-color: #58A39C; }}
+            QTableWidget::item:selected {{ background-color: #58A39C; color: white; }}
             QHeaderView::section {{ background-color: #252525; border: none; padding: 10px; color: #888; font-weight: bold; }}
             QProgressBar::chunk {{ background-color: #58A39C; border-radius: 3px; }}
             QSlider::groove:horizontal {{ height: 4px; background: #111; border-radius: 2px; }}
